@@ -21,6 +21,9 @@ import einx
 from einops import einsum, repeat, rearrange, reduce, pack, unpack
 from einops.layers.torch import Rearrange
 
+# standerd attention modules
+from .attention_utils import MultiGroupAttention, FineAttention, LinearAttention
+
 # b - batch
 # h - heads
 # qh - grouped query heads
@@ -52,10 +55,6 @@ def divisible_by(num, den):
     """Check if `num` is divisible by `den`."""
     return (num % den) == 0
 
-def max_neg_value(t):
-    """Return the maximum negative value for the tensor's dtype."""
-    return -torch.finfo(t.dtype).max
-
 def pad_at_dim(t, pad, dim=-1, value=0.):
     """Pad tensor `t` at specified dimension with given value."""
     dims_from_right = (-dim - 1) if dim < 0 else (t.ndim - dim - 1)
@@ -65,93 +64,6 @@ def pad_at_dim(t, pad, dim=-1, value=0.):
 def straight_through(t, target):
     """Straight-through estimator for gradient computation."""
     return t + (target - t).detach()
-
-# Multi-Group Attention Function
-def MGA(q, k, v, mask=None, return_sim=False, scale=None):
-    """
-    Perform Multi-Group Attention (MGA) computation.
-
-    Args:
-        q (Tensor): Query tensor of shape (batch, heads, seq_len, dim_head).
-        k (Tensor): Key tensor of shape (batch, kv_heads, kv_seq_len, dim_head).
-        v (Tensor): Value tensor of shape (batch, kv_heads, kv_seq_len, dim_head).
-        mask (Tensor, optional): Attention mask. Defaults to None.
-        return_sim (bool): Whether to return similarity scores. Defaults to False.
-        scale (float, optional): Scaling factor. Defaults to sqrt(dim_head).
-
-    Returns:
-        Tensor: Attention output, and optionally similarity scores if return_sim=True.
-    """
-    scale = default(scale, q.shape[-1] ** -0.5)
-    q_heads, k_heads = q.shape[1], k.shape[1]
-    num_grouped_queries = q_heads // k_heads
-    q = rearrange(q, 'b (h qh) i d -> b h qh i d', qh=num_grouped_queries)
-    sim = einsum(q, k, 'b h qh i d, b h j d -> b h qh i j') * scale
-    mask_value = max_neg_value(sim)
-    if exists(mask):
-        sim = sim.masked_fill(~mask, mask_value)
-    attn = sim.softmax(dim=-1)
-    out = einsum(attn, v, 'b h qh i j, b h j d -> b h qh i d')
-    out = rearrange(out, 'b h qh i d -> b (h qh) i d')
-    if return_sim:
-        sim = rearrange(sim, 'b h qh i j -> b (h qh) i j')
-        return out, sim
-    return out
-
-def LinearAttention(fq, fk, fv, fmask, seq_len, fine_num_grouped_queries=1, scale=1.0, eps=1e-6):
-    """
-    Linear Attention 计算，将传统的 softmax 注意力替换为基于核函数的分解方法。
-    
-    参数:
-      fq: 查询张量，形状 [b, h, 1, n, head_d]
-      fk: 键张量，形状 [b, h, n, L, head_d]
-      fv: 值张量，形状 [b, h, n, L, head_d]
-      fmask: 掩码张量，形状 [b, h, 1, n, head_d]，用于屏蔽不需要的 key 位置
-      seq_len: 原始序列长度 n
-      fine_num_grouped_queries: 分组查询的数量（默认为1）
-      scale: 缩放因子（此处未直接使用，可根据需求保留或移除）
-      eps: 防止除零的小常数
-      
-    返回:
-      fine_attn_out: 经过线性注意力计算后的输出，形状 [b, (h * fine_num_grouped_queries), seq_len, head_d]
-    """
-    
-    # 重排 fq，引入 qh 分组维度
-    fq = rearrange(fq, 'b (h qh) ... -> b h qh ...', qh=fine_num_grouped_queries)  # [b, h, qh, 1, n, head_d]
-    
-    # 特征映射：使用 ELU + 1 作为线性注意力的近似
-    phi = lambda x: torch.nn.functional.elu(x) + 1
-    
-    # 对 fq 和 fk 应用特征映射
-    fq_phi = phi(fq)  # [b, h, qh, 1, n, head_d]
-    fk_phi = phi(fk)  # [b, h, n, L, head_d]
-    
-    # 计算键值对的累积和 KV = phi(K)^T V
-    kv = einsum(fk_phi, fv, 'b h n l d, b h n l v -> b h n d v')  # [b, h, n, head_d, head_d]
-    
-    # 计算归一化因子 Z = sum_l phi(K_l)
-    z = einsum(fk_phi, 'b h n l d -> b h n d')  # [b, h, n, head_d]
-    z = z.unsqueeze(2).unsqueeze(-1)  # [b, h, n, 1, head_d, 1]
-    
-    # 计算线性注意力输出 Q(KV) 并除以归一化因子 Z
-    # 修正 einsum，确保维度匹配
-    fine_attn_out = einsum(fq_phi, kv, 'b h qh i n d, b h n d v -> b h qh i n v')  # [b, h, qh, 1, n, head_d]
-    fine_attn_out = fine_attn_out / (z + eps) * scale  # 除以 Z 并应用 scale
-    
-    # 掩码处理
-    mask_value = max_neg_value(fine_attn_out)
-    fmask = fmask.unsqueeze(2).expand(-1, -1, fine_num_grouped_queries, -1, -1, -1)  # [b, h, qh, 1, n, head_d]
-    fine_attn_out = fine_attn_out.masked_fill(~fmask, mask_value)
-    
-    # 重排回原始格式
-    fine_attn_out = rearrange(fine_attn_out, 'b h qh i n d -> b (h qh) i n d')  # [b, (h qh), 1, n, head_d]
-    fine_attn_out = fine_attn_out.squeeze(2)  # 移除 i=1 的维度，得到 [b, (h qh), n, head_d]
-    
-    # 切片（保持与原始代码一致）
-    fine_attn_out = fine_attn_out[..., :seq_len, :]
-    
-    return fine_attn_out
-
 
 class AggregatedGated(nn.Module):
     def __init__(
@@ -324,7 +236,7 @@ class SparseAttention(Module):
         cv = cat((mem_cv, cv), dim = -2)
 
         # Coarse attention over compressed key/values
-        compressed_attn_out, csim = MGA(cq, ck, cv, mask = None, return_sim = True)
+        compressed_attn_out, csim = MultiGroupAttention(cq, ck, cv, mask = None, return_sim = True)
         
         # for 2. , will give them relative positions with rotary - compressed needs to be handled separately (even if they already have intra block absolute positions)
         # Apply rotary embeddings for fine attention
@@ -375,19 +287,19 @@ class SparseAttention(Module):
                 selected_block_indices = pad_at_dim(selected_block_indices, (0, remainder), value = 0, dim = -2)
 
             # Rearrange for block selection, select out the spatial crops of keys / values for fine attention
-            fk = rearrange(fk, 'b h (w n) d -> b h w n d', w = num_fine_blocks)
+            fk = rearrange(fk, 'b h (w n) d -> b h w n d', w = num_fine_blocks)#[b,h,n/blocksize,blocksize,dim_head]
             fv = rearrange(fv, 'b h (w n) d -> b h w n d', w = num_fine_blocks)
 
             # Expand and gather selected blocks
             if self.query_heads_share_selected_kv:
-                fk = repeat(fk, 'b h w j d -> b h i w j d', i = selected_block_indices.shape[2])#???
+                fk = repeat(fk, 'b h w j d -> b h i w j d', i = selected_block_indices.shape[2])#[b,h,n,n/blocksize,blocksize,dim_head]
                 fv = repeat(fv, 'b h w j d -> b h i w j d', i = selected_block_indices.shape[2])
             else:
                 fk = repeat(fk, 'b h w j d -> b (h qh) i w j d', i = selected_block_indices.shape[2], qh = self.num_grouped_queries)
                 fv = repeat(fv, 'b h w j d -> b (h qh) i w j d', i = selected_block_indices.shape[2], qh = self.num_grouped_queries)
 
-            selected_block_indices = repeat(selected_block_indices, 'b h i sel -> b h i sel j d', j = fk.shape[-2], d = fk.shape[-1])
-            fk = fk.gather(3, selected_block_indices)
+            selected_block_indices = repeat(selected_block_indices, 'b h i sel -> b h i sel j d', j = fk.shape[-2], d = fk.shape[-1])#[b,h,n,num_selected,blocksize,dim_head]
+            fk = fk.gather(3, selected_block_indices)#[b,h,n,num_selected,blocksize,dim_head]
             fv = fv.gather(3, selected_block_indices)
 
             
@@ -396,19 +308,12 @@ class SparseAttention(Module):
                 fk = einx.multiply('b h i sel, b h i sel j d -> b h i sel j d', gates, fk)
 
             # Merge selected key/values
-            fk, fv = tuple(rearrange(t, 'b h i w j d -> b h i (w j) d') for t in (fk, fv))
+            fk, fv = tuple(rearrange(t, 'b h i w j d -> b h i (w j) d') for t in (fk, fv))#[b,h,n,num_selected*blocksize,dim_head]
             fmask = repeat(fmask, 'b h i w -> b h 1 i (w j)', j = self.block_size)
         
-            # Fine attention computation(change to Linear Attention!)
-            #fine_attn_out = LinearAttention(fq,fk,fv,fmask,seq_len,fine_num_grouped_queries)
-            fq = rearrange(fq, 'b (h qh) ... -> b h qh ...', qh = fine_num_grouped_queries)
-            fsim = einsum(fq, fk, 'b h qh i d, b h i j d -> b h qh i j') * self.scale
-            mask_value = max_neg_value(fsim)
-            fsim = fsim.masked_fill(~fmask, mask_value)
-            fattn = fsim.softmax(dim = -1)
-            fine_attn_out = einsum(fattn, fv, 'b h qh i j, b h i j d -> b h qh i d')
-            fine_attn_out = rearrange(fine_attn_out, 'b h qh ... -> b (h qh) ...')
-            fine_attn_out = fine_attn_out[..., :seq_len, :]
+            # Fine attention computation
+            #fine_attn_out = LinearAttention(fq,fk,fv,fmask,seq_len,fine_num_grouped_queries)#Even slower?!
+            fine_attn_out = FineAttention(fq,fk,fv,fmask,seq_len,fine_num_grouped_queries)
 
         # Gated combine coarse and fine attention outputs
         out = self.aggregated_gated_mlp(inp, compressed_attn_out, fine_attn_out)

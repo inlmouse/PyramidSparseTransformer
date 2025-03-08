@@ -44,11 +44,11 @@ def test_transformer():
     ]
     #tokens = torch.randn(2, 33, 512)
     T1 = time.time()
-    for i in range(10):
+    for i in range(1):
         output = trans(tokenslist)
         gc.collect()
     T2 = time.time()
-    print('程序运行时间:%s毫秒' % ((T2 - T1)*1000/10))
+    print('程序运行时间:%s毫秒' % ((T2 - T1)*1000/1))
     #assert tokenslist.shape == output.shape
 
 test_transformer()

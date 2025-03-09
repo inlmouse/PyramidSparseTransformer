@@ -4,7 +4,6 @@ from einops.layers.torch import Rearrange
 
 from sparse_attention import SparseAttention
 from sparse_attention.pst import PyramidSparseEncoder
-import gc
 import time
 
 def test_compress_networks():
@@ -33,7 +32,7 @@ def test_transformer():
         depth = 2,
         dim_head = 32,
         heads = 8,
-        block_size = 4,#4*4 patchify
+        block_size = 15,#4*4 patchify
         num_selected_blocks = 8
     )
     tokenslist = [
@@ -44,11 +43,10 @@ def test_transformer():
     ]
     #tokens = torch.randn(2, 33, 512)
     T1 = time.time()
-    for i in range(1):
+    for i in range(100):
         output = trans(tokenslist)
-        gc.collect()
     T2 = time.time()
-    print('程序运行时间:%s毫秒' % ((T2 - T1)*1000/1))
+    print('程序运行时间:%s毫秒' % ((T2 - T1)*1000/100))
     #assert tokenslist.shape == output.shape
 
 test_transformer()

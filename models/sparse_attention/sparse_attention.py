@@ -103,7 +103,7 @@ class SparseAttention(Module):
         num_compressed_mem_kv: int = 1,
         norm: bool = True,
         use_diff_topk: bool = False,
-        query_heads_share_selected_kv: bool = True,
+        use_global_kv_selection: bool = True,
         compress_mlp: Module | None = None,
         compress_mlp_expand_factor: float = 1.,
         aggregated_gated_mlp: Module | None = None
@@ -121,7 +121,7 @@ class SparseAttention(Module):
             num_compressed_mem_kv (int): Number of memory compressed key/value pairs.
             norm (bool): Whether to apply RMS normalization. Defaults to True.
             use_diff_topk (bool): Use differentiable top-k selection. Defaults to False.
-            query_heads_share_selected_kv (bool): Whether query heads share selected key/values.
+            use_global_kv_selection (bool): Whether share seq length for selected kv. False means repeat seq length.
             compress_mlp (Module, optional): MLP for compressing key/values. Defaults to None.
             compress_mlp_expand_factor (float): Expansion factor for compress MLP hidden dim.
             aggregated_gated_mlp (Module, optional): MLP for combining strategies.
@@ -132,6 +132,7 @@ class SparseAttention(Module):
         kv_heads = default(kv_heads, heads)
         assert kv_heads <= heads and divisible_by(heads, kv_heads), "kv_heads must be <= heads and heads must be divisible by kv_heads"
         assert dim_head * heads == dim, "dim_head * heads must be equal dim"
+        self.dim_head = dim_head
         self.heads = heads
         self.kv_heads = kv_heads
         self.num_grouped_queries = heads // kv_heads
@@ -175,7 +176,7 @@ class SparseAttention(Module):
 
         # Selection parameters
         self.use_diff_topk = use_diff_topk
-        self.query_heads_share_selected_kv = query_heads_share_selected_kv
+        self.use_global_kv_selection = use_global_kv_selection
 
         # they combine the three sparse branches through a learned combine with sigmoid activation
 
@@ -248,72 +249,90 @@ class SparseAttention(Module):
         importance_scores = csim[..., num_mem_compress_kv:] #[b,h,n,n/blocksize]
         num_selected = min(self.num_selected_blocks, num_compress_blocks)
 
-        # maybe average the compressed attention across each grouped queries (per key / values)
-
-        if self.query_heads_share_selected_kv:
-            importance_scores = reduce(importance_scores, 'b (h grouped_queries) ... -> b h ...', 'mean', grouped_queries = self.num_grouped_queries)
-
+        if self.use_global_kv_selection:
+            # 全局模式：对所有查询位置求均值，得到每个 block 的全局重要性
+            importance_scores_global = importance_scores.mean(dim=2)  # [b, h, num_compress_blocks]
+            selected_importance_values, selected_block_indices = importance_scores_global.topk(num_selected, dim=-1)
             fine_num_grouped_queries = self.num_grouped_queries
         else:
+            # 局部模式：对每个查询位置分别选取 topk
+            selected_importance_values, selected_block_indices = importance_scores.topk(num_selected, dim=-1)  # [b, h, n, num_selected]
             fine_num_grouped_queries = 1
 
-        
-        # Softmax over importance scores for block selection
-        importance_scores = F.pad(importance_scores, (1, 0), value = -1e3)
-        importance_scores = importance_scores.softmax(dim = -1)
-        importance_scores = importance_scores[..., 1:]
-
-        # Select top-k blocks
-        selected_importance_values, selected_block_indices = importance_scores.topk(num_selected, dim = -1)
-        #selected_importance_values shape [b,h,n,num_selected]
-        
-    
-        # Prepare fine attention inputs
+        # 2. 准备 fine attention 的输入
         fq, fk, fv = q, k, v
-        fmask = selected_importance_values > 1e-10
+        fmask = selected_importance_values > 1e-10  # 在全局模式下： [b, h, num_selected]；局部模式下：[b, h, n, num_selected]
 
+        # 可选：如果使用可微分 topk gating
         gates = None
         if self.use_diff_topk:
             gates = straight_through(selected_importance_values, 1.)
 
+        # 3. 针对序列长度不足时的 padding（局部模式下需要对 n 维 padding；全局模式下 fk, fv 不涉及 n 维）
+        if seq_len < fine_divisible_seq_len:
+            remainder = fine_divisible_seq_len - seq_len
+            fk = pad_at_dim(fk, (0, remainder), value=0., dim=-2)
+            fv = pad_at_dim(fv, (0, remainder), value=0., dim=-2)
+            fq = pad_at_dim(fq, (0, remainder), value=0., dim=-2)
+            if not self.use_global_kv_selection:
+                fmask = pad_at_dim(fmask, (0, remainder), value=False, dim=-2)
+                selected_block_indices = pad_at_dim(selected_block_indices, (0, remainder), value=0, dim=-2)
+
+        # 4. 重排键和值为 block 形式
+        #    fk, fv 原始形状假设为 [b, h, (num_fine_blocks*block_size), dim_head]
+        fk = rearrange(fk, 'b h (w n) d -> b h w n d', w=num_fine_blocks)  # [b, h, num_fine_blocks, block_size, d]
+        fv = rearrange(fv, 'b h (w n) d -> b h w n d', w=num_fine_blocks)
+
+        # 5. 根据全局/局部模式分别处理
+        if self.use_global_kv_selection:
+            # 全局模式：selected_block_indices shape [b, h, num_selected]
+            # 直接从 fk、fv 的 block 维度（即第2维）选择对应块
+            # 首先扩展 selected_block_indices 使其与 block_size 对齐：
+            # 扩展为 [b, h, num_selected, block_size, d]
+            sel_idx = selected_block_indices.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, -1, self.block_size, self.dim_head)
+            # 在 fk、fv 上 gather 第2维：
+            fk_selected = fk.gather(2, sel_idx)  # 得到 [b, h, num_selected, block_size, d]
+            fv_selected = fv.gather(2, sel_idx)
+            # 合并块维度和块内长度：得到 [b, h, num_selected*block_size, d]
+            fk_selected = rearrange(fk_selected, 'b h num_selected j d -> b h (num_selected j) d')
+            fv_selected = rearrange(fv_selected, 'b h num_selected j d -> b h (num_selected j) d')
+            # 处理 fmask：原 fmask shape 为 [b, h, num_selected],扩展到 [b, h, num_selected, block_size]
+            fmask = fmask.unsqueeze(-1).expand(-1, -1, -1, self.block_size)
+            fmask = rearrange(fmask, 'b h num_selected j -> b h 1 (num_selected j)')
+            fmask = repeat(fmask, 'b h 1 (num_selectedxj) -> b h 1 n (num_selectedxj)', n = fq.shape[2])
         else:
-            # Pad if sequence length is not block-divisible
-            if seq_len < fine_divisible_seq_len:
-                remainder = fine_divisible_seq_len - seq_len
-                fk = pad_at_dim(fk, (0, remainder), value = 0., dim = -2)
-                fv = pad_at_dim(fv, (0, remainder), value = 0., dim = -2)
-                fq = pad_at_dim(fq, (0, remainder), value = 0., dim = -2)
-                fmask = pad_at_dim(fmask, (0, remainder), value = False, dim = -2)
-                selected_block_indices = pad_at_dim(selected_block_indices, (0, remainder), value = 0, dim = -2)
+            # 局部模式：selected_block_indices shape为 [b, h, n, num_selected]
+            # 重复 fk、fv 在查询维度 (n) 上扩展：
+            fk = repeat(fk, 'b h w j d -> b h i w j d', i=selected_block_indices.shape[2])
+            fv = repeat(fv, 'b h w j d -> b h i w j d', i=selected_block_indices.shape[2])
+            # 扩展 selected_block_indices 至形状 [b, h, n, num_selected, block_size, d]
+            sel_idx = selected_block_indices[:, :, :, :, None, None].expand(-1, -1, -1, -1, self.block_size, self.dim_head)
+            fk_selected = fk.gather(3, sel_idx)  # 在第3维（block维度）进行 gather
+            fv_selected = fv.gather(3, sel_idx)
+            fk_selected = rearrange(fk_selected, 'b h i w j d -> b h i (w j) d')
+            fv_selected = rearrange(fv_selected, 'b h i w j d -> b h i (w j) d')
+            fmask = repeat(fmask, 'b h i w -> b h 1 i (w j)', j=self.block_size)
 
-            # Rearrange for block selection, select out the spatial crops of keys / values for fine attention
-            fk = rearrange(fk, 'b h (w n) d -> b h w n d', w = num_fine_blocks)#[b,h,n/blocksize,blocksize,dim_head]
-            fv = rearrange(fv, 'b h (w n) d -> b h w n d', w = num_fine_blocks)
-
-            # Expand and gather selected blocks
-            if self.query_heads_share_selected_kv:
-                fk = repeat(fk, 'b h w j d -> b h i w j d', i = selected_block_indices.shape[2])#[b,h,n,n/blocksize,blocksize,dim_head]
-                fv = repeat(fv, 'b h w j d -> b h i w j d', i = selected_block_indices.shape[2])
-            else:
-                fk = repeat(fk, 'b h w j d -> b (h qh) i w j d', i = selected_block_indices.shape[2], qh = self.num_grouped_queries)
-                fv = repeat(fv, 'b h w j d -> b (h qh) i w j d', i = selected_block_indices.shape[2], qh = self.num_grouped_queries)
-
-            selected_block_indices = repeat(selected_block_indices, 'b h i sel -> b h i sel j d', j = fk.shape[-2], d = fk.shape[-1])#[b,h,n,num_selected,blocksize,dim_head]
-            fk = fk.gather(3, selected_block_indices)#[b,h,n,num_selected,blocksize,dim_head]
-            fv = fv.gather(3, selected_block_indices)
-
-            
-            # differential topk gating
-            if self.use_diff_topk:
-                fk = einx.multiply('b h i sel, b h i sel j d -> b h i sel j d', gates, fk)
-
-            # Merge selected key/values
-            fk, fv = tuple(rearrange(t, 'b h i w j d -> b h i (w j) d') for t in (fk, fv))#[b,h,n,num_selected*blocksize,dim_head]
-            fmask = repeat(fmask, 'b h i w -> b h 1 i (w j)', j = self.block_size)
+        # 后续 fine attention 计算中，查询仍保持形状 [b, h, fine_num_grouped_queries, n, d]
+        # 此时 fk_selected 和 fv_selected 在全局模式下形状为 [b, h, num_selected*block_size, d]
+        # 而局部模式下形状为 [b, h, n, num_selected*block_size, d]
         
-            # Fine attention computation
-            #fine_attn_out = LinearAttention(fq,fk,fv,fmask,seq_len,fine_num_grouped_queries)#Even slower?!
-            fine_attn_out = FineAttention(fq,fk,fv,fmask,seq_len,fine_num_grouped_queries)
+        # Now, for fine attention, keep fq as is:
+        # Assume fq has shape [b, h, 1, n, d] (or after rearrange: [b, h, qh, n, d] with qh=1)
+        fq = rearrange(fq, 'b (h qh) ... -> b h qh ...', qh = fine_num_grouped_queries)
+
+        # Compute fine attention similarity:
+        # fq shape: [b, h, qh, n, d], fk_selected: [b, h, num_selected*block_size, d]
+        fsim = einsum(fq, fk_selected, 'b h qh i d, b h j d -> b h qh i j') * self.scale
+        mask_value = -torch.finfo(fsim.dtype).max  # 或者使用自定义的 max_neg_value
+        fsim = fsim.masked_fill(~fmask, mask_value)
+        fattn = fsim.softmax(dim=-1)
+        fine_attn_out = einsum(fattn, fv_selected, 'b h qh i j, b h j d -> b h qh i d')
+
+        # Merge heads and grouped queries
+        fine_attn_out = rearrange(fine_attn_out, 'b h qh ... -> b (h qh) ...')
+        fine_attn_out = fine_attn_out[..., :seq_len, :]
+        
 
         # Gated combine coarse and fine attention outputs
         out = self.aggregated_gated_mlp(inp, compressed_attn_out, fine_attn_out)

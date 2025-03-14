@@ -22,7 +22,7 @@ from einops import einsum, repeat, rearrange, reduce, pack, unpack
 from einops.layers.torch import Rearrange
 
 # standerd attention modules
-from .attention_utils import MultiGroupAttention, FineAttention, LinearAttention
+from .attention_utils import MultiGroupAttention, FineAttention, LinearAttention, LinearMultiGroupAttention
 
 # b - batch
 # h - heads
@@ -192,18 +192,22 @@ class SparseAttention(Module):
         self.combine_heads = nn.Linear(dim_inner, dim, bias=False)
 
 
-    def forward(self, inp: Tensor) -> Tensor:
+    def forward(self, inp: Tensor, queries: Tensor = None) -> Tensor:
         """
         Forward pass of SparseAttention, combining coarse and fine attention mechanisms.
 
         Args:
             inp (Tensor): Input tensor of shape (batch, seq_len, dim).
-
+            queries (Tensor): For decoder queries
         Returns:
             Tensor: Output tensor of shape (batch, seq_len, dim).
         """
         batch, seq_len = inp.shape[:2]
         heads = self.heads
+
+        # For decoder inputs
+        if queries is not None:
+            q = queries
 
         # Compute block numbers
         compress_divisible_seq_len = round_down_mult(seq_len, self.block_size)
@@ -217,7 +221,8 @@ class SparseAttention(Module):
         # Project to queries, keys, values
         q, k, v = self.to_qkv(inp).split(self.qkv_split, dim=-1)
         q, k, v = map(self.split_heads, (q, k, v)) #[b,h,n,d/h]
-        
+        # reinp = self.split_heads(inp)[:, :, :compress_divisible_seq_len, :]
+
         # Prepare compressed key/values
         k_pos = repeat(self.k_intrablock_positions, 'h n d -> h (r n) d', r=num_compress_blocks)
         v_pos = repeat(self.v_intrablock_positions, 'h n d -> h (r n) d', r=num_compress_blocks)
@@ -228,14 +233,13 @@ class SparseAttention(Module):
         ck = self.k_compress(k_compress_input) # Equation (7) of the Native Sparse Attention paper
         cv = self.v_compress(v_compress_input) #[b,h,n/blocksize, d/h]
 
-
         # 1. coarse attention over compressed
         # Incorporate memory compressed key/values
         mem_ck, mem_cv = repeat(self.compress_mem_kv, 'kv ... -> kv b ...', b = batch)
         num_mem_compress_kv = mem_ck.shape[-2]
         ck = cat((mem_ck, ck), dim = -2)
         cv = cat((mem_cv, cv), dim = -2)
-
+        # compressed_attn_out = LinearMultiGroupAttention(cq, ck, cv, mask = None)
         # Coarse attention over compressed key/values
         compressed_attn_out, csim = MultiGroupAttention(cq, ck, cv, mask = None, return_sim = True)
         
@@ -251,6 +255,9 @@ class SparseAttention(Module):
 
         if self.use_global_kv_selection:
             # 全局模式：对所有查询位置求均值，得到每个 block 的全局重要性
+            # reinp = rearrange(reinp, 'b h (n_blocks block_size) d -> b h n_blocks block_size d', block_size=self.block_size)#[b, h, n_blocks, block_size, head_dim]
+            # pooled = reinp.mean(dim=3)  # [b, h, n_blocks, head_dim]
+            # importance_scores_global = pooled.mean(dim=-1) # [b, h, n_blocks]
             importance_scores_global = importance_scores.mean(dim=2)  # [b, h, num_compress_blocks]
             selected_importance_values, selected_block_indices = importance_scores_global.topk(num_selected, dim=-1)
             fine_num_grouped_queries = self.num_grouped_queries

@@ -14,6 +14,81 @@ def max_neg_value(t):
     """Return the maximum negative value for the tensor's dtype."""
     return -torch.finfo(t.dtype).max
 
+def LinearMultiGroupAttention(q, k, v, mask=None, scale=None, eps=1e-6):
+    """
+    执行线性多组注意力（Linear Multi-Group Attention, MGA）计算。
+
+    该函数将查询张量按需拆分为多个组，基于线性注意力机制计算分组查询、键和值之间的注意力，
+    并支持可选的注意力掩码（采用简化处理方式），最终输出注意力结果。
+
+    参数：
+        q (Tensor)：查询张量，形状为 [batch, heads, seq_len, dim_head]。
+        k (Tensor)：键张量，形状为 [batch, kv_heads, kv_seq_len, dim_head]。
+        v (Tensor)：值张量，形状为 [batch, kv_heads, kv_seq_len, dim_head]。
+        mask (Tensor, 可选)：注意力掩码，可以广播到注意力分数的形状。默认为 None。
+        return_sim (bool)：是否返回相似度分数。默认为 False。在线性注意力中，相似度不会显式计算，
+                          若设为 True，则返回 None。
+        scale (float, 可选)：点积注意力的缩放因子。若为 None，则默认为 q.shape[-1]**-0.5。
+
+    返回：
+        Tensor：注意力输出，形状为 [batch, heads, seq_len, dim_head]。
+                若 return_sim 为 True，则返回 (output, similarity)，其中 similarity 为 None。
+    """
+    # 1. 如果未提供缩放因子，则设置默认值
+    scale = scale if scale is not None else q.shape[-1] ** -0.5
+    
+    # 2. 获取 q 和 k 的头数
+    q_heads, k_heads = q.shape[1], k.shape[1]
+    # 计算每个键/值头对应的分组查询数量
+    num_grouped_queries = q_heads // k_heads
+    
+    # 3. 重排查询张量 q 的形状为 [batch, kv_heads, grouped_queries, seq_len, dim_head]
+    #    输入 q 的形状为 [b, heads*grouped_queries, seq_len, dim_head]
+    q = rearrange(q, 'b (h qh) i d -> b h qh i d', qh=num_grouped_queries)
+    
+    
+    # 5. 应用特征映射 phi(x) = elu(x) + 1，以近似 softmax 行为
+    phi_q = (F.elu(q) + 1) * scale  # 形状：[b, h, qh, i, d]
+    phi_k = (F.elu(k) + 1) * scale  # 形状：[b, h, j, d]
+    
+    # 6. 处理掩码（简化方式）
+    #    如果提供了掩码，则将其应用到 phi_k 和 v 上，屏蔽掉被掩码的位置
+    if mask is not None:
+        # 假设掩码形状为 [b, 1, i, j] 或兼容形状，广播到 [b, h, j]
+        # 调整掩码以匹配 k 和 v 的维度：[b, h, j, 1]
+        mask = mask[..., None]  # 添加广播维度
+        # 将掩码应用到 phi_k 和 v（假设掩码与 kv_seq_len 维度对齐）
+        phi_k = phi_k * mask  # 形状：[b, h, j, d]
+        v = v * mask          # 形状：[b, h, j, d]
+    
+    # 7. 计算分母中的 sum_phi_k
+    sum_phi_k = phi_k.sum(dim=2)  # 形状：[b, h, d]
+    
+    # 8. 计算线性注意力的分子部分 phi_k^T V
+    #    phi_k：[b, h, j, d]
+    #    v：    [b, h, j, d]
+    #    kv：   [b, h, d, d]
+    kv = einsum(phi_k, v, 'b h j d, b h j e -> b h d e')
+    
+    # 9. 计算分子：phi_q (phi_k^T V)
+    #    phi_q：[b, h, qh, i, d]
+    #    kv：   [b, h, d, e]
+    #    out：  [b, h, qh, i, e]
+    out = einsum(phi_q, kv, 'b h qh i d, b h d e -> b h qh i e')
+    
+    # 10. 计算分母：phi_q (sum_phi_k)
+    #     sum_phi_k：[b, h, d]
+    #     denom：    [b, h, qh, i]
+    denom = einsum(phi_q, sum_phi_k, 'b h qh i d, b h d -> b h qh i')
+    
+    # 11. 归一化输出
+    out = out / (denom[..., None] + eps)  # 形状：[b, h, qh, i, e]
+    
+    # 12. 重排输出以匹配原始形状：[b, heads, seq_len, dim_head]
+    out = rearrange(out, 'b h qh i d -> b (h qh) i d')
+
+    return out
+
 def MultiGroupAttention(q, k, v, mask=None, return_sim=False, scale=None):
     """
     Perform Multi-Group Attention (MGA) computation.

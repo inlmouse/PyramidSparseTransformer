@@ -3,7 +3,7 @@ from torch import nn
 from einops.layers.torch import Rearrange
 
 from sparse_attention import SparseAttention
-from sparse_attention.pst import PyramidSparseEncoder
+from sparse_attention.pst import PyramidSparseEncoder, PyramidSparseDecoder
 
 import time
 
@@ -33,16 +33,19 @@ def test_transformer():
         depth = 2,
         dim_head = 32,
         heads = 8,
-        block_size = 49,#4*4 patchify
+        block_size = 25,#5*5~7*7 patchify
         num_selected_blocks = 8
-    )
+    ).to("cpu").to(torch.float32)
+    decoder = PyramidSparseDecoder(num_feature_levels=4, dim=256, depth=6)
     tokenslist = [
-        torch.randn(4, 76*106, 256),
-        torch.randn(4, 38*53, 256),
-        torch.randn(4, 19*27, 256),
-        torch.randn(4, 10*14, 256)
+        torch.randn(4, 76*106, 256).to("cpu").to(torch.float32),
+        torch.randn(4, 38*53, 256).to("cpu").to(torch.float32),
+        torch.randn(4, 19*27, 256).to("cpu").to(torch.float32),
+        torch.randn(4, 10*14, 256).to("cpu").to(torch.float32)
     ]
     #tokens = torch.randn(2, 33, 512)
+    decoder(tokenslist)
+    output = trans(tokenslist)
     T1 = time.time()
     for i in range(10):
         output = trans(tokenslist)

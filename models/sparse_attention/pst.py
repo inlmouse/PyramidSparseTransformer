@@ -78,8 +78,8 @@ class PyramidSparseEncoder(nn.Module):
                 block_size=block_size,
                 num_selected_blocks=num_selected_blocks,
                 compress_mlp = AttentionPool(dim_head, block_size)
-            ).to("cuda").to(torch.float16)
-            ff = FeedForward(dim = dim, expansion_factor = ff_expansion_factor).to("cuda").to(torch.float16)
+            )
+            ff = FeedForward(dim = dim, expansion_factor = ff_expansion_factor)
             layer = nn.ModuleList([copy.deepcopy(ModuleList([attn, ff])) for i in range(depth)])
             self.layers.append(layer)
         self.norm = RMSNorm(dim)
@@ -126,7 +126,7 @@ class PyramidSparseDecoder(nn.Module):
         num_feature_levels: int = 4,  # 特征层级数
         dim: int = 256,              # 输入特征维度
         depth: int = 6,              # 解码器层数
-        dim_head: int = 64,          # 每个注意力头的维度
+        dim_head: int = 32,          # 每个注意力头的维度
         heads: int = 8,              # 注意力头数
         num_queries: int = 300,      # 查询嵌入的数量
         block_size: int = 4,         # 稀疏注意力块大小

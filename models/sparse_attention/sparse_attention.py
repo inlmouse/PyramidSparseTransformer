@@ -142,11 +142,14 @@ class SparseAttention(Module):
         dim_inner = dim_head * heads
         dim_kv_inner = dim_head * kv_heads
         self.qkv_split = (dim_inner, dim_kv_inner, dim_kv_inner)
+        self.kv_split = (dim_kv_inner, dim_kv_inner)
 
         # Layers
         self.norm = nn.RMSNorm(dim) if norm else nn.Identity()
         self.rotary_emb = RotaryEmbedding(dim_head)
-        self.to_qkv = nn.Linear(dim, sum(self.qkv_split), bias=False)
+        self.to_q = nn.Linear(dim, dim_inner, bias=False)
+        self.to_k = nn.Linear(dim, dim_kv_inner, bias=False)
+        self.to_v = nn.Linear(dim, dim_kv_inner, bias=False)
 
         # Block configuration
         self.block_size = block_size
@@ -205,9 +208,18 @@ class SparseAttention(Module):
         batch, seq_len = inp.shape[:2]
         heads = self.heads
 
-        # For decoder inputs
+        # For decoder inputs, deal with projection to queries, keys, values
+        # q, k, v = self.to_qkv(inp).split(self.qkv_split, dim=-1)
+        # q, k, v = map(self.split_heads, (q, k, v)) #[b,h,n,d/h]
         if queries is not None:
-            q = queries
+            q = self.split_heads(self.to_q(queries))#[b,h,q_n,d/h]
+            k = self.split_heads(self.to_k(inp))#[b,h,n,d/h]
+            v = self.split_heads(self.to_v(inp))
+            q_seq_len = q.shape[2]
+        else:
+            q = self.split_heads(self.to_q(inp))#[b,h,n,d/h]
+            k = self.split_heads(self.to_k(inp))
+            v = self.split_heads(self.to_v(inp))
 
         # Compute block numbers
         compress_divisible_seq_len = round_down_mult(seq_len, self.block_size)
@@ -217,10 +229,6 @@ class SparseAttention(Module):
 
         # Normalize input
         inp = self.norm(inp)
-
-        # Project to queries, keys, values
-        q, k, v = self.to_qkv(inp).split(self.qkv_split, dim=-1)
-        q, k, v = map(self.split_heads, (q, k, v)) #[b,h,n,d/h]
         # reinp = self.split_heads(inp)[:, :, :compress_divisible_seq_len, :]
 
         # Prepare compressed key/values
@@ -239,9 +247,12 @@ class SparseAttention(Module):
         num_mem_compress_kv = mem_ck.shape[-2]
         ck = cat((mem_ck, ck), dim = -2)
         cv = cat((mem_cv, cv), dim = -2)
+        
         # compressed_attn_out = LinearMultiGroupAttention(cq, ck, cv, mask = None)
         # Coarse attention over compressed key/values
         compressed_attn_out, csim = MultiGroupAttention(cq, ck, cv, mask = None, return_sim = True)
+        if queries is not None:
+            compressed_attn_out = compressed_attn_out[..., :q_seq_len, :]
         
         # for 2. , will give them relative positions with rotary - compressed needs to be handled separately (even if they already have intra block absolute positions)
         # Apply rotary embeddings for fine attention
@@ -338,11 +349,17 @@ class SparseAttention(Module):
 
         # Merge heads and grouped queries
         fine_attn_out = rearrange(fine_attn_out, 'b h qh ... -> b (h qh) ...')
-        fine_attn_out = fine_attn_out[..., :seq_len, :]
+        if queries is not None:
+            fine_attn_out = fine_attn_out[..., :q_seq_len, :]
+        else:
+            fine_attn_out = fine_attn_out[..., :seq_len, :]
         
 
         # Gated combine coarse and fine attention outputs
-        out = self.aggregated_gated_mlp(inp, compressed_attn_out, fine_attn_out)
+        if queries is not None:
+            out = compressed_attn_out + fine_attn_out # gate aggregated is uesless in decoder?
+        else:
+            out = self.aggregated_gated_mlp(inp, compressed_attn_out, fine_attn_out)
 
         # Merge heads and project output
         out = self.merge_heads(out)

@@ -153,9 +153,6 @@ class PyramidSparseDecoder(nn.Module):
         self.num_feature_levels = num_feature_levels
         self.num_queries = num_queries
 
-        # 可学习的查询嵌入
-        self.query_embed = nn.Parameter(torch.randn(num_queries, dim))
-
         # 解码器层
         self.layers = nn.ModuleList()
         for _ in range(depth):
@@ -182,37 +179,89 @@ class PyramidSparseDecoder(nn.Module):
             nn.Linear(dim//2, num_feature_levels)
         )
 
-    def forward(self, encoded_tokenlist: list[Tensor]) -> Tensor:
+    def forward(self, encoded_tokenlist: list[Tensor], query_embed: Tensor) -> Tensor:
         """
         前向传播。
 
         参数:
             encoded_tokenlist (list[Tensor]): 编码器输出的多层级特征列表，每项形状为 (batch, seq_len, dim)。
-
+            query_embed (Tensor): initial target queries (batch, num_queries, dim)
+        
         返回:
             Tensor: 解码器输出，形状为 (batch, num_queries, dim)。
         """
         assert len(encoded_tokenlist) == self.num_feature_levels, "特征层级数不匹配"
-
-        batch_size = encoded_tokenlist[0].shape[0]
-        # 初始化查询，扩展为批次维度
-        queries = self.query_embed.unsqueeze(0).expand(batch_size, -1, -1)  # (batch, num_queries, dim)
-        logits = self.weightselector(queries)
-        weights = torch.softmax(logits, dim=-1)  # (batch, num_queries, num_levels)
-        output = torch.zeros(queries.shape)
-        for i, token in enumerate(encoded_tokenlist):
-            # 逐层解码
-            for self_attn, cross_attn, ff in self.layers:
-                # 自注意力：查询之间的交互
-                queries, _ = self_attn(queries, queries, queries)
-                # 交叉注意力：查询与编码器特征交互
-                attn_out = cross_attn(token, queries)  # (batch, num_queries, dim)
-                # 残差连接
-                queries = queries + attn_out
-                # 前馈网络
-                ff_out = ff(queries)
-                queries = queries + ff_out
-            output += weights[:, :, i].unsqueeze(-1) * queries  # 加权累加
+        
+        queries = query_embed  # 初始化 queries
+        
+        # 逐层解码
+        for layer in self.layers:
+            self_attn, cross_attn, ff = layer
+            # 自注意力：查询之间的交互
+            queries, _ = self_attn(queries, queries, queries)
+            # 根据当前 queries 动态计算权重
+            logits = self.weightselector(queries)
+            weights = torch.softmax(logits, dim=-1)  # (batch, num_queries, num_levels)
+            # 交叉注意力：与多层级特征交互
+            attn_out = 0
+            for i, token in enumerate(encoded_tokenlist):
+                # 对每个层级的特征计算交叉注意力
+                attn = cross_attn(inp = token, queries = queries)  # (batch, num_queries, dim)
+                # 加权累加
+                attn_out += weights[:, :, i].unsqueeze(-1) * attn
+            # 残差连接
+            queries = queries + attn_out
+            # 前馈网络
+            ff_out = ff(queries)
+            queries = queries + ff_out
         # 最终归一化
         output = self.norm(queries)
         return output
+    
+# PyramidSparseTransformer 类
+class PyramidSparseTransformer(nn.Module):
+    def __init__(self, 
+                 d_model=256, 
+                 block_sizes=None, 
+                 top_k=None, 
+                 num_heads=None, 
+                 mlp_ratio = 4., 
+                 num_encoder_layers=1, 
+                 num_decoder_layers=1,
+                 dropout=0.1, 
+                 num_feature_levels=4
+        ):
+        super().__init__()
+        self.d_model = d_model
+        self.encoder = PyramidSparseEncoder(
+            num_feature_levels = num_feature_levels,
+            dim = d_model,
+            depth = num_encoder_layers,
+            dim_head = d_model//num_heads,
+            heads = num_heads,
+            ff_expansion_factor = mlp_ratio,
+            block_size = block_sizes,
+            num_selected_blocks = top_k
+        )
+
+        self.decoder = PyramidSparseDecoder(
+            num_feature_levels = num_feature_levels,
+            dim = d_model,
+            depth = num_decoder_layers,
+            dim_head = d_model//num_heads,
+            heads = num_heads,
+            ff_expansion_factor = mlp_ratio,
+            block_size = block_sizes,
+            num_selected_blocks = top_k
+        )
+
+    def forward(self, srcs, query_embed):
+        # srcs: List of [B, C, H_i, W_i]
+        # query_embed: [N_q, C*2]
+        memory = self.encoder(tokenslist = srcs)
+        B = memory[0].shape[0]
+        query_embed, tgt = torch.split(query_embed, self.d_model, dim=1)
+        query_embed = query_embed.unsqueeze(0).expand(B, -1, -1)
+        tgt = tgt.unsqueeze(0).expand(B, -1, -1)# uesless???
+        hs = self.decoder(encoded_tokenlist = memory, query_embed = query_embed)
+        return hs  # [B, N_q, C]

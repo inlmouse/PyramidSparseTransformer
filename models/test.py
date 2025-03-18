@@ -3,11 +3,11 @@ from torch import nn
 from einops.layers.torch import Rearrange
 
 from sparse_attention import SparseAttention
-from sparse_attention.pst import PyramidSparseEncoder, PyramidSparseDecoder
+from sparse_attention.pyramid_sparse_transformer import PyramidSparseEncoder, PyramidSparseDecoder, PyramidSparseTransformer
 
 import time
 
-def test_compress_networks():
+def test_attention():
     from sparse_attention.compresser import AttentionPool
 
     attn = SparseAttention(
@@ -26,7 +26,7 @@ def test_compress_networks():
     assert tokens.shape == attended.shape
 
 
-def test_transformer():
+def test_encoder_decoder():
     trans = PyramidSparseEncoder(
         num_feature_levels = 4,
         dim = 256,
@@ -57,5 +57,27 @@ def test_transformer():
     T2 = time.time()
     print('程序运行时间:%s毫秒' % ((T2 - T1)*1000/10))
     #assert tokenslist.shape == output.shape
+
+def test_transformer():
+    t = PyramidSparseTransformer(
+        d_model = 256,
+        block_sizes=25, 
+        top_k=16, 
+        num_heads=8, 
+        mlp_ratio = 4., 
+        num_encoder_layers=1, 
+        num_decoder_layers=1,
+        dropout=0.1, 
+        num_feature_levels=4
+        )
+    tokenslist = [
+        torch.randn(8, 76*106, 256).to("cpu").to(torch.float32),
+        torch.randn(8, 38*53, 256).to("cpu").to(torch.float32),
+        torch.randn(8, 19*27, 256).to("cpu").to(torch.float32),
+        torch.randn(8, 10*14, 256).to("cpu").to(torch.float32)
+    ]
+    query_embed = torch.randn(300, 256*2).to("cpu").to(torch.float32)
+    output = t(srcs = tokenslist, query_embed = query_embed)
+    print(output.shape)
 
 test_transformer()

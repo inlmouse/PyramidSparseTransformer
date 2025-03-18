@@ -30,25 +30,30 @@ def test_transformer():
     trans = PyramidSparseEncoder(
         num_feature_levels = 4,
         dim = 256,
-        depth = 2,
+        depth = 1,
         dim_head = 32,
         heads = 8,
         block_size = 25,#5*5~7*7 patchify
         num_selected_blocks = 8
     ).to("cpu").to(torch.float32)
-    decoder = PyramidSparseDecoder(num_feature_levels=4, dim=256, depth=6)
+    decoder = PyramidSparseDecoder(
+        num_feature_levels=4, 
+        dim=256, 
+        depth=1, 
+        block_size = 25, 
+        num_selected_blocks = 8).to("cpu").to(torch.float32)
     tokenslist = [
-        torch.randn(4, 76*106, 256).to("cpu").to(torch.float32),
-        torch.randn(4, 38*53, 256).to("cpu").to(torch.float32),
-        torch.randn(4, 19*27, 256).to("cpu").to(torch.float32),
-        torch.randn(4, 10*14, 256).to("cpu").to(torch.float32)
+        torch.randn(8, 76*106, 256).to("cpu").to(torch.float32),
+        torch.randn(8, 38*53, 256).to("cpu").to(torch.float32),
+        torch.randn(8, 19*27, 256).to("cpu").to(torch.float32),
+        torch.randn(8, 10*14, 256).to("cpu").to(torch.float32)
     ]
-    #tokens = torch.randn(2, 33, 512)
-    decoder(tokenslist)
-    output = trans(tokenslist)
+    memory = trans(tokenslist)
+    memory = decoder(memory)
     T1 = time.time()
     for i in range(10):
-        output = trans(tokenslist)
+        memory = trans(tokenslist)
+        memory = decoder(memory)
     T2 = time.time()
     print('程序运行时间:%s毫秒' % ((T2 - T1)*1000/10))
     #assert tokenslist.shape == output.shape

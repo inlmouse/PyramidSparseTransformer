@@ -106,7 +106,9 @@ class SparseAttention(Module):
         use_global_kv_selection: bool = True,
         compress_mlp: Module | None = None,
         compress_mlp_expand_factor: float = 1.,
-        aggregated_gated_mlp: Module | None = None
+        aggregated_gated_mlp: Module | None = None,
+        coarse_linear_attention: bool = True,
+        fine_linear_attention: bool = False
     ):
         """
         Initialize the SparseAttention module, implementing an efficient attention mechanism.
@@ -137,12 +139,14 @@ class SparseAttention(Module):
         self.kv_heads = kv_heads
         self.num_grouped_queries = heads // kv_heads
         self.scale = dim_head ** -0.5
+        self.coarse_linear_attention = coarse_linear_attention
+        self.fine_linear_attention = fine_linear_attention
 
         # Dimensions
         dim_inner = dim_head * heads
         dim_kv_inner = dim_head * kv_heads
-        self.qkv_split = (dim_inner, dim_kv_inner, dim_kv_inner)
-        self.kv_split = (dim_kv_inner, dim_kv_inner)
+        # self.qkv_split = (dim_inner, dim_kv_inner, dim_kv_inner)
+        # self.kv_split = (dim_kv_inner, dim_kv_inner)
 
         # Layers
         self.norm = nn.RMSNorm(dim) if norm else nn.Identity()
@@ -215,6 +219,8 @@ class SparseAttention(Module):
             q = self.split_heads(self.to_q(queries))#[b,h,q_n,d/h]
             k = self.split_heads(self.to_k(inp))#[b,h,n,d/h]
             v = self.split_heads(self.to_v(inp))
+            if inp.shape[1] < queries.shape[1]:
+                return torch.zeros(queries.shape)#too small for decoding``
             q_seq_len = q.shape[2]
         else:
             q = self.split_heads(self.to_q(inp))#[b,h,n,d/h]
@@ -229,7 +235,8 @@ class SparseAttention(Module):
 
         # Normalize input
         inp = self.norm(inp)
-        # reinp = self.split_heads(inp)[:, :, :compress_divisible_seq_len, :]
+        if self.coarse_linear_attention:
+            reinp = self.split_heads(inp)[:, :, :compress_divisible_seq_len, :]
 
         # Prepare compressed key/values
         k_pos = repeat(self.k_intrablock_positions, 'h n d -> h (r n) d', r=num_compress_blocks)
@@ -248,9 +255,14 @@ class SparseAttention(Module):
         ck = cat((mem_ck, ck), dim = -2)
         cv = cat((mem_cv, cv), dim = -2)
         
-        # compressed_attn_out = LinearMultiGroupAttention(cq, ck, cv, mask = None)
         # Coarse attention over compressed key/values
-        compressed_attn_out, csim = MultiGroupAttention(cq, ck, cv, mask = None, return_sim = True)
+        if self.coarse_linear_attention:
+            compressed_attn_out = LinearMultiGroupAttention(cq, ck, cv, mask = None)
+        else:
+            compressed_attn_out, csim = MultiGroupAttention(cq, ck, cv, mask = None, return_sim = True)     
+            # Select blocks for fine attention based on coarse attention similarities
+            importance_scores = csim[..., num_mem_compress_kv:] #[b,h,n,n/blocksize]
+        
         if queries is not None:
             compressed_attn_out = compressed_attn_out[..., :q_seq_len, :]
         
@@ -258,18 +270,17 @@ class SparseAttention(Module):
         # Apply rotary embeddings for fine attention
         q, k = self.rotary_emb.rotate_queries_with_cached_keys(q, k)
 
-
         # 2. fine attention over selected based on compressed attention logits - variables prepended with `f` stands for the fine attention pathway
-        # Select blocks for fine attention based on coarse attention similarities
-        importance_scores = csim[..., num_mem_compress_kv:] #[b,h,n,n/blocksize]
         num_selected = min(self.num_selected_blocks, num_compress_blocks)
 
         if self.use_global_kv_selection:
             # 全局模式：对所有查询位置求均值，得到每个 block 的全局重要性
-            # reinp = rearrange(reinp, 'b h (n_blocks block_size) d -> b h n_blocks block_size d', block_size=self.block_size)#[b, h, n_blocks, block_size, head_dim]
-            # pooled = reinp.mean(dim=3)  # [b, h, n_blocks, head_dim]
-            # importance_scores_global = pooled.mean(dim=-1) # [b, h, n_blocks]
-            importance_scores_global = importance_scores.mean(dim=2)  # [b, h, num_compress_blocks]
+            if self.coarse_linear_attention:
+                reinp = rearrange(reinp, 'b h (n_blocks block_size) d -> b h n_blocks block_size d', block_size=self.block_size)#[b, h, n_blocks, block_size, head_dim]
+                pooled = reinp.mean(dim=3)  # [b, h, n_blocks, head_dim]
+                importance_scores_global = pooled.mean(dim=-1) # [b, h, n_blocks]
+            else:
+                importance_scores_global = importance_scores.mean(dim=2)  # [b, h, num_compress_blocks]
             selected_importance_values, selected_block_indices = importance_scores_global.topk(num_selected, dim=-1)
             fine_num_grouped_queries = self.num_grouped_queries
         else:

@@ -5,7 +5,7 @@
 # ------------------------------------------------------------------------
 import torch
 from torch import nn, Tensor
-from torch.nn import Module, ModuleList, Linear, RMSNorm
+from torch.nn import Module, ModuleList, Linear, RMSNorm, functional
 
 from math import ceil
 from tqdm import tqdm
@@ -69,19 +69,17 @@ class PyramidSparseEncoder(nn.Module):
     ):
         super().__init__()
         self.num_feature_levels = num_feature_levels
-        self.layers = []
-        for _ in range(num_feature_levels):
-            attn = SparseAttention(
-                dim = dim,
-                dim_head = dim_head,
-                heads = heads,
-                block_size=block_size,
-                num_selected_blocks=num_selected_blocks,
-                compress_mlp = AttentionPool(dim_head, block_size)
-            )
-            ff = FeedForward(dim = dim, expansion_factor = ff_expansion_factor)
-            layer = nn.ModuleList([copy.deepcopy(ModuleList([attn, ff])) for i in range(depth)])
-            self.layers.append(layer)
+        # All feature level share the same transformer
+        attn = SparseAttention(
+            dim = dim,
+            dim_head = dim_head,
+            heads = heads,
+            block_size=block_size,
+            num_selected_blocks=num_selected_blocks,
+            compress_mlp = AttentionPool(dim_head, block_size)
+        )
+        ff = FeedForward(dim = dim, expansion_factor = ff_expansion_factor)
+        self.layer = nn.ModuleList([copy.deepcopy(ModuleList([attn, ff])) for i in range(depth)])
         self.norm = RMSNorm(dim)
     
     
@@ -108,14 +106,19 @@ class PyramidSparseEncoder(nn.Module):
     def forward(self, tokenslist):
         assert len(tokenslist) == self.num_feature_levels
         outputs = []
-        # for each feature level
-        for i, layer in enumerate(self.layers):
-            tokens = tokenslist[i]
-            for attn, ff in layer:
-                attn_out = attn(tokens)
-                tokens = attn_out + tokens
-                tokens = ff(tokens) + tokens
-            output = self.norm(tokens)
+        prev_token = None
+        # for each feature level, from top level to bottom level
+        for i in range(self.num_feature_levels-1, -1, -1):
+            curr_token = tokenslist[i]
+            if prev_token is not None:
+                # 上采样前一粗糙层级的注意力输出并融合
+                prev_token_up = functional.upsample(prev_token, curr_token.shape)
+                curr_token = curr_token + prev_token_up
+            for attn, ff in self.layer:
+                attn_out = attn(curr_token)
+                curr_token = attn_out + curr_token
+                curr_token = ff(curr_token) + curr_token
+            output = self.norm(curr_token)
             outputs.append(output)
         return outputs
 
@@ -129,6 +132,7 @@ class PyramidSparseDecoder(nn.Module):
         dim_head: int = 32,          # 每个注意力头的维度
         heads: int = 8,              # 注意力头数
         num_queries: int = 300,      # 查询嵌入的数量
+        ff_expansion_factor = 4.,
         block_size: int = 4,         # 稀疏注意力块大小
         num_selected_blocks: int = 4 # 稀疏注意力选择的块数
     ):
@@ -166,15 +170,17 @@ class PyramidSparseDecoder(nn.Module):
                 num_selected_blocks=num_selected_blocks
             )
             # 前馈网络
-            ff = nn.Sequential(
-                nn.Linear(dim, dim * 4),
-                nn.ReLU(),
-                nn.Linear(dim * 4, dim)
-            )
+            ff = FeedForward(dim = dim, expansion_factor = ff_expansion_factor)
             self.layers.append(nn.ModuleList([self_attn, cross_attn, ff]))
 
         # 层归一化
         self.norm = nn.LayerNorm(dim)
+        # 根据输入查询（query）的特征，为每个查询分配不同特征层级的注意力权重，从而帮助解码器在多尺度特征处理中聚焦于最相关的层级。
+        self.weightselector = nn.Sequential(
+            nn.Linear(dim, dim//2),  
+            nn.ReLU(), 
+            nn.Linear(dim//2, num_feature_levels)
+        )
 
     def forward(self, encoded_tokenlist: list[Tensor]) -> Tensor:
         """
@@ -191,25 +197,22 @@ class PyramidSparseDecoder(nn.Module):
         batch_size = encoded_tokenlist[0].shape[0]
         # 初始化查询，扩展为批次维度
         queries = self.query_embed.unsqueeze(0).expand(batch_size, -1, -1)  # (batch, num_queries, dim)
-
-        # 逐层解码
-        for self_attn, cross_attn, ff in self.layers:
-            # 自注意力：查询之间的交互
-            queries, _ = self_attn(queries, queries, queries)
-
-            # 将多层级特征合并为一个张量, does this make sence? just concat
-            encoded = torch.cat(encoded_tokenlist, dim=1)  # (batch, total_seq_len, dim)
-
-            # 交叉注意力：查询与编码器特征交互
-            attn_out = cross_attn(encoded, queries)  # (batch, num_queries, dim)
-
-            # 残差连接
-            queries = queries + attn_out
-
-            # 前馈网络
-            ff_out = ff(queries)
-            queries = queries + ff_out
-
+        logits = self.weightselector(queries)
+        weights = torch.softmax(logits, dim=-1)  # (batch, num_queries, num_levels)
+        output = torch.zeros(queries.shape)
+        for i, token in enumerate(encoded_tokenlist):
+            # 逐层解码
+            for self_attn, cross_attn, ff in self.layers:
+                # 自注意力：查询之间的交互
+                queries, _ = self_attn(queries, queries, queries)
+                # 交叉注意力：查询与编码器特征交互
+                attn_out = cross_attn(token, queries)  # (batch, num_queries, dim)
+                # 残差连接
+                queries = queries + attn_out
+                # 前馈网络
+                ff_out = ff(queries)
+                queries = queries + ff_out
+            output += weights[:, :, i].unsqueeze(-1) * queries  # 加权累加
         # 最终归一化
         output = self.norm(queries)
         return output

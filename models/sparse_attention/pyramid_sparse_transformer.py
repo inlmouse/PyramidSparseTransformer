@@ -11,8 +11,8 @@ from math import ceil
 from tqdm import tqdm
 import copy
 
-from sparse_attention.compresser import AttentionPool
-from sparse_attention.sparse_attention import SparseAttention
+from .compresser import AttentionPool
+from .sparse_attention import SparseAttention
 
 
 # functions
@@ -69,6 +69,7 @@ class PyramidSparseEncoder(nn.Module):
     ):
         super().__init__()
         self.num_feature_levels = num_feature_levels
+        
         # All feature level share the same transformer
         attn = SparseAttention(
             dim = dim,
@@ -152,7 +153,7 @@ class PyramidSparseDecoder(nn.Module):
         super().__init__()
         self.num_feature_levels = num_feature_levels
         self.num_queries = num_queries
-
+        
         # 解码器层
         self.layers = nn.ModuleList()
         for _ in range(depth):
@@ -179,7 +180,7 @@ class PyramidSparseDecoder(nn.Module):
             nn.Linear(dim//2, num_feature_levels)
         )
 
-    def forward(self, encoded_tokenlist: list[Tensor], query_embed: Tensor) -> Tensor:
+    def forward(self, encoded_tokenlist: list[Tensor], query_embed: Tensor) -> list[Tensor]:
         """
         前向传播。
 
@@ -188,24 +189,24 @@ class PyramidSparseDecoder(nn.Module):
             query_embed (Tensor): initial target queries (batch, num_queries, dim)
         
         返回:
-            Tensor: 解码器输出，形状为 (batch, num_queries, dim)。
+            Tensor: 解码器输出，形状为 list[(batch, num_queries, dim)],长度为depth 。
         """
         assert len(encoded_tokenlist) == self.num_feature_levels, "特征层级数不匹配"
         
         queries = query_embed  # 初始化 queries
-        
-        # 逐层解码
-        for layer in self.layers:
+        intermediate = []
+        # 逐深度解码
+        for layer in self.layers:#range(depth)
             self_attn, cross_attn, ff = layer
             # 自注意力：查询之间的交互
             queries, _ = self_attn(queries, queries, queries)
             # 根据当前 queries 动态计算权重
             logits = self.weightselector(queries)
             weights = torch.softmax(logits, dim=-1)  # (batch, num_queries, num_levels)
-            # 交叉注意力：与多层级特征交互
-            attn_out = 0
-            for i, token in enumerate(encoded_tokenlist):
-                # 对每个层级的特征计算交叉注意力
+            
+            # 对每个层级的特征计算交叉注意力
+            attn_out = torch.zeros_like(queries, dtype=queries.dtype, device=queries.device)
+            for i, token in enumerate(encoded_tokenlist):#range(num_feature_levels)
                 attn = cross_attn(inp = token, queries = queries)  # (batch, num_queries, dim)
                 # 加权累加
                 attn_out += weights[:, :, i].unsqueeze(-1) * attn
@@ -214,17 +215,18 @@ class PyramidSparseDecoder(nn.Module):
             # 前馈网络
             ff_out = ff(queries)
             queries = queries + ff_out
-        # 最终归一化
-        output = self.norm(queries)
-        return output
+            # 最终归一化
+            output = self.norm(queries)
+            intermediate.append(output)
+        return intermediate
     
 # PyramidSparseTransformer 类
 class PyramidSparseTransformer(nn.Module):
     def __init__(self, 
                  d_model=256, 
-                 block_sizes=None, 
-                 top_k=None, 
-                 num_heads=None, 
+                 block_sizes=25, 
+                 top_k=16, 
+                 num_heads=8, 
                  mlp_ratio = 4., 
                  num_encoder_layers=1, 
                  num_decoder_layers=1,
@@ -233,6 +235,10 @@ class PyramidSparseTransformer(nn.Module):
         ):
         super().__init__()
         self.d_model = d_model
+        self.num_heads = num_heads
+        self.num_feature_levels = num_feature_levels
+        self.num_encoder_layers = num_encoder_layers
+        self.num_decoder_layers = num_decoder_layers
         self.encoder = PyramidSparseEncoder(
             num_feature_levels = num_feature_levels,
             dim = d_model,
@@ -264,4 +270,13 @@ class PyramidSparseTransformer(nn.Module):
         query_embed = query_embed.unsqueeze(0).expand(B, -1, -1)
         tgt = tgt.unsqueeze(0).expand(B, -1, -1)# uesless???
         hs = self.decoder(encoded_tokenlist = memory, query_embed = query_embed)
-        return hs  # [B, N_q, C]
+        return torch.stack(hs)  # [dec_layers, B, N_q, C]
+    
+def build_pyramidsparse_transformer(args):
+    return PyramidSparseTransformer(
+        d_model=args.hidden_dim,
+        num_encoder_layers=args.enc_layers,
+        num_decoder_layers=args.dec_layers,
+        dropout=args.dropout,
+        num_feature_levels=args.num_feature_levels
+    )

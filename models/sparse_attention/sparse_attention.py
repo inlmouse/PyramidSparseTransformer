@@ -220,7 +220,7 @@ class SparseAttention(Module):
             k = self.split_heads(self.to_k(inp))#[b,h,n,d/h]
             v = self.split_heads(self.to_v(inp))
             if inp.shape[1] < queries.shape[1]:
-                return torch.zeros(queries.shape)#too small for decoding
+                return torch.zeros(queries.shape).to(device=queries.device)#too small for decoding
             q_seq_len = q.shape[2]
         else:
             q = self.split_heads(self.to_q(inp))#[b,h,n,d/h]
